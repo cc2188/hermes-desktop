@@ -89,7 +89,7 @@ function Models({ visible }: ModelsProps = {}): React.JSX.Element {
   const discoveryBaseUrl =
     formProvider === "custom" || localPresetForProvider(formProvider)
       ? formBaseUrl
-      : undefined;
+      : formBaseUrl;
   const [discoveryRefresh, setDiscoveryRefresh] = useState(0);
   const discovery = useDiscoveredModels({
     provider: formProvider,

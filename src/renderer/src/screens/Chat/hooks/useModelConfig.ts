@@ -127,7 +127,7 @@ export function useModelConfig(profile?: string): UseModelConfigResult {
       // baseUrl whenever the entry isn't `custom`; the gateway falls back
       // to the provider's canonical URL.
       const effectiveBaseUrl =
-        provider === "custom" || provider === OLLAMA_CLOUD_PROVIDER ? baseUrl : "";
+        provider === "custom" || provider === OLLAMA_CLOUD_PROVIDER ? baseUrl : baseUrl;
       await window.hermesAPI.setModelConfig(
         provider,
         model,

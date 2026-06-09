@@ -261,7 +261,7 @@ function Providers({
   const [discoveryRefresh, setDiscoveryRefresh] = useState(0);
   const discovery = useDiscoveredModels({
     provider: modelProvider,
-    baseUrl: isCustomProvider ? modelBaseUrl : undefined,
+    baseUrl: isCustomProvider ? modelBaseUrl : modelBaseUrl,
     profile,
     enabled: !!visible && modelProvider !== "auto",
     refreshToken: discoveryRefresh,
