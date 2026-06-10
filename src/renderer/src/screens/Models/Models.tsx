@@ -68,7 +68,7 @@ export function modelConfigBaseUrlForProvider(
 ): string {
   return provider === "custom" || localPresetForProvider(provider)
     ? baseUrl.trim()
-    : "";
+    : baseUrl.trim();
 }
 
 interface ModelsProps {
