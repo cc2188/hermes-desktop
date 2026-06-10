@@ -22,5 +22,7 @@ jobs:
           git remote add upstream https://github.com/fathah/hermes-desktop.git
           git fetch upstream
           git checkout main
-          git merge upstream/main --no-edit
-          git push origin main
+          # Rebase our commits on top of upstream so local patches are preserved.
+          # If there are conflicts the job fails and you resolve manually.
+          git rebase upstream/main
+          git push --force-with-lease origin main
