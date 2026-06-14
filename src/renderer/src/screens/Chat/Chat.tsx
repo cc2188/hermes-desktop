@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Zap } from "lucide-react";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
-import { ChatHeader } from "./ChatHeader";
 import { ChatEmptyState } from "./ChatEmptyState";
 import { MessageList } from "./MessageList";
 import { ModelPicker } from "./ModelPicker";
@@ -31,29 +31,71 @@ interface QueuedMessage {
 export type { ChatMessage } from "./types";
 
 interface ChatProps {
-  messages: ChatMessage[];
-  setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
-  sessionId: string | null;
+  /** Stable id for this conversation/run. One <Chat> is mounted per run; all
+   *  remain mounted (background sessions) and only the active one is shown. */
+  runId: string;
+  /** Seed transcript when re-opening a session from history; empty for new chats. */
+  initialMessages?: ChatMessage[];
+  /** Gateway session id when resuming a known session; null for a new chat. */
+  initialSessionId?: string | null;
+  /** Whether this run is the one currently shown (drives keyboard handlers). */
+  active?: boolean;
   profile?: string;
   onSessionStarted?: () => void;
   onNewChat?: () => void;
   /** Optional callback to navigate to Settings → Diagnose section
    *  when the user clicks "Show details" in the config-health banner. */
   onOpenDiagnose?: () => void;
+  /** Reports the agent generating state so the sidebar / active-sessions bar
+   *  can show a spinner on each running session. */
+  onLoadingChange?: (runId: string, loading: boolean) => void;
+  /** Reports the gateway session id once known, so the parent can map
+   *  runId ↔ sessionId (live re-attach, spinners, titles). */
+  onSessionIdChange?: (runId: string, sessionId: string | null) => void;
+  /** Reports the first user message as a best-effort conversation title. */
+  onTitleChange?: (runId: string, title: string) => void;
 }
 
 function Chat({
-  messages,
-  setMessages,
-  sessionId,
+  runId,
+  initialMessages,
+  initialSessionId,
+  active = true,
   profile,
   onSessionStarted,
   onNewChat,
   onOpenDiagnose,
+  onLoadingChange,
+  onSessionIdChange,
+  onTitleChange,
 }: ChatProps): React.JSX.Element {
   const { t } = useI18n();
+  const [messages, setMessages] = useState<ChatMessage[]>(
+    initialMessages ?? [],
+  );
   const [isLoading, setIsLoading] = useState(false);
-  const [hermesSessionId, setHermesSessionId] = useState<string | null>(null);
+  useEffect(() => {
+    onLoadingChange?.(runId, isLoading);
+  }, [runId, isLoading, onLoadingChange]);
+  const [hermesSessionId, setHermesSessionId] = useState<string | null>(
+    initialSessionId ?? null,
+  );
+  // Surface the gateway session id upward whenever it resolves/changes.
+  useEffect(() => {
+    onSessionIdChange?.(runId, hermesSessionId);
+  }, [runId, hermesSessionId, onSessionIdChange]);
+  // Best-effort title from the first user bubble (for the active-sessions bar).
+  const reportedTitleRef = useRef(false);
+  useEffect(() => {
+    if (reportedTitleRef.current) return;
+    const firstUser = messages.find(
+      (m) => m.role === "user" && "content" in m && m.content.trim(),
+    );
+    if (firstUser && "content" in firstUser) {
+      reportedTitleRef.current = true;
+      onTitleChange?.(runId, firstUser.content.slice(0, 60));
+    }
+  }, [runId, messages, onTitleChange]);
   const [toolProgress, setToolProgress] = useState<string | null>(null);
   const [usage, setUsage] = useState<UsageState | null>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -158,6 +200,7 @@ function Chat({
   ]);
 
   useChatIPC({
+    runId,
     setMessages,
     setHermesSessionId,
     setToolProgress,
@@ -165,31 +208,15 @@ function Chat({
     setUsage,
   });
 
-  // Reset hermes session when the parent clears messages (new chat).
-  // Effect-driven sync because `messages` is owned by the parent; a key-based
-  // remount would discard unrelated local state (model picker, etc.).
-  useEffect(() => {
-    if (messages.length === 0) {
-      setHermesSessionId(null);
-      setContextFolder(null);
-      queueRef.current = [];
-      setQueuedMessages([]);
-    }
-  }, [messages]);
+  // No parent-driven reset effects: each run is its own <Chat key={runId}>
+  // instance. A new chat is a fresh mount, and switching sessions just flips
+  // which mounted instance is shown — local state (session id, context folder,
+  // queue) belongs to this run and persists while it streams in the background.
 
-  // When the parent swaps to a different session, sync local state to it:
-  // the gateway session id (a stale one resumes/deletes the WRONG session —
-  // issue #276) and the per-conversation context folder (issue #27). Chat is
-  // not remounted on session switch, so this must be done explicitly.
+  // Cmd/Ctrl+N → new chat. Only the active (visible) run handles it; otherwise
+  // every mounted background Chat would fire onNewChat in parallel.
   useEffect(() => {
-    setHermesSessionId(sessionId);
-    setContextFolder(null);
-    queueRef.current = [];
-    setQueuedMessages([]);
-  }, [sessionId]);
-
-  // Cmd/Ctrl+N → new chat
-  useEffect(() => {
+    if (!active) return;
     function onKey(e: KeyboardEvent): void {
       if ((e.metaKey || e.ctrlKey) && e.key === "n") {
         e.preventDefault();
@@ -198,7 +225,7 @@ function Chat({
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onNewChat]);
+  }, [active, onNewChat]);
 
   // "Copy entire chat" context-menu items (issue #298) — serialise the whole
   // conversation in the requested format and copy it. A ref keeps the latest
@@ -208,17 +235,19 @@ function Chat({
     messagesRef.current = messages;
   });
   useEffect(() => {
+    if (!active) return;
     return window.hermesAPI.onContextMenuCopyChat((format) => {
       const msgs = messagesRef.current;
       if (msgs.length === 0) return;
       void window.hermesAPI.copyToClipboard(buildChatTranscript(msgs, format));
     });
-  }, []);
+  }, [active]);
 
   // "Select All" on a message (issue #298): the native selectAll role would
   // select the entire window, so scope it to the .chat-bubble under the
   // cursor — the user can then Copy that message.
   useEffect(() => {
+    if (!active) return;
     return window.hermesAPI.onContextMenuSelectBubble(({ x, y }) => {
       const bubble = document.elementFromPoint(x, y)?.closest(".chat-bubble");
       if (!bubble) return;
@@ -226,11 +255,12 @@ function Chat({
       selection?.removeAllRanges();
       selection?.selectAllChildren(bubble);
     });
-  }, []);
+  }, [active]);
 
   // Restrict the native context menu to chat bubbles and editable fields
   // so it doesn't appear on random UI chrome (sessions list, settings, etc.).
   useEffect(() => {
+    if (!active) return;
     const onContextMenu = (e: MouseEvent): void => {
       const target = e.target as Element | null;
       const inBubble = target?.closest(".chat-bubble") != null;
@@ -242,7 +272,7 @@ function Chat({
     };
     document.addEventListener("contextmenu", onContextMenu);
     return () => document.removeEventListener("contextmenu", onContextMenu);
-  }, []);
+  }, [active]);
 
   const addAgentMessage = useCallback(
     (content: string) => {
@@ -272,10 +302,10 @@ function Chat({
 
   const handleClear = useCallback(() => {
     if (isLoading) {
-      window.hermesAPI.abortChat();
+      window.hermesAPI.abortChat(runId);
       setIsLoading(false);
     }
-    const idToDelete = hermesSessionId ?? sessionId;
+    const idToDelete = hermesSessionId;
     if (idToDelete) {
       void window.hermesAPI.deleteSession(idToDelete);
       void window.hermesAPI.clearStagedAttachments(idToDelete);
@@ -287,7 +317,7 @@ function Chat({
     setToolProgress(null);
     queueRef.current = [];
     setQueuedMessages([]);
-  }, [isLoading, hermesSessionId, sessionId, setMessages]);
+  }, [isLoading, runId, hermesSessionId, setMessages]);
 
   const localCommands = useLocalCommands({
     profile,
@@ -299,6 +329,7 @@ function Chat({
   });
 
   const actions = useChatActions({
+    runId,
     profile,
     hermesSessionId,
     messages,
@@ -430,16 +461,6 @@ function Chat({
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      <ChatHeader
-        sessionId={sessionId}
-        usage={usage}
-        fastMode={fastMode}
-        hasMessages={messages.length > 0}
-        onToggleFast={toggleFastMode}
-        onNewChat={onNewChat}
-        onClear={handleClear}
-      />
-
       <ConfigHealthBanner profile={profile} onOpenDiagnose={onOpenDiagnose} />
 
       <div className="chat-body">
@@ -465,7 +486,10 @@ function Chat({
       </div>
 
       <div className="chat-input-area">
-        <QueuedMessages messages={queuedMessages} onRemove={handleRemoveQueued} />
+        <QueuedMessages
+          messages={queuedMessages}
+          onRemove={handleRemoveQueued}
+        />
         <ChatInput
           ref={chatInputRef}
           isLoading={isLoading}
@@ -493,6 +517,25 @@ function Chat({
                 value={reasoningEffort}
                 onChange={setReasoningEffort}
               />
+              <div className="chat-fast-wrapper">
+                <button
+                  type="button"
+                  className={`btn-ghost chat-fast-btn ${fastMode ? "chat-fast-active" : ""}`}
+                  onClick={toggleFastMode}
+                >
+                  <Zap size={14} />
+                </button>
+                <div className="chat-fast-popover">
+                  <strong>
+                    {fastMode ? t("chat.fastModeOn") : t("chat.fastMode")}
+                  </strong>
+                  <span>
+                    {fastMode
+                      ? t("chat.fastModeActive")
+                      : t("chat.fastModeInactive")}
+                  </span>
+                </div>
+              </div>
               <ContextFolderChip
                 contextFolder={contextFolder}
                 show={!remoteMode}

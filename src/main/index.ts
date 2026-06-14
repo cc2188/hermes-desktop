@@ -10,6 +10,7 @@ import {
   session,
 } from "electron";
 import { join, extname } from "path";
+import { randomUUID } from "crypto";
 import { readdir, readFile, stat } from "fs/promises";
 import { electronApp, optimizer, is } from "@electron-toolkit/utils";
 import type { AppUpdater } from "electron-updater";
@@ -125,7 +126,8 @@ import {
   setConnectionConfig,
   getPlatformEnabled,
   setPlatformEnabled,
-  getApiServerKey,
+  getApiServerKeyStatus,
+  invalidateSecretsCache,
 } from "./config";
 import {
   getAuxiliaryConfig,
@@ -158,6 +160,11 @@ import {
   deleteProfile,
   setActiveProfile,
 } from "./profiles";
+import {
+  setProfileColor,
+  setProfileAvatar,
+  removeProfileAvatar,
+} from "./profile-meta";
 import {
   readMemory,
   addMemoryEntry,
@@ -301,7 +308,10 @@ process.on("unhandledRejection", (reason) => {
 });
 
 let mainWindow: BrowserWindow | null = null;
-let currentChatAbort: (() => void) | null = null;
+// Per-run abort handles, keyed by the renderer-minted runId. Multiple chats
+// run concurrently (background sessions / multi-agent), so starting a new run
+// must not abort siblings — only a re-send under the same runId does.
+const activeRuns = new Map<string, () => void>();
 
 function openExternalUrl(rawUrl: unknown): void {
   if (!isAllowedExternalUrl(rawUrl)) {
@@ -787,9 +797,17 @@ function setupIPC(): void {
 
   // API_SERVER_KEY management — lets the renderer detect a missing key and
   // generate one with a button click (local mode) or show instructions (remote/SSH).
-  ipcMain.handle("get-api-server-key-status", (_event, profile?: string) => {
-    const key = getApiServerKey(profile);
-    return { hasKey: key.length > 0 };
+  // Additive shape: `hasKey` stays the required primary field; `providerId` /
+  // `checkedAt` are optional extras for a follow-up Settings/Gateway UI.
+  ipcMain.handle("get-api-server-key-status", (_event, profile?: string) =>
+    getApiServerKeyStatus(profile),
+  );
+
+  // Drops the cached secrets-provider values so the next status check re-reads
+  // the vault — lets the renderer's "Refresh from vault" button take effect
+  // immediately instead of waiting out the cache TTL.
+  ipcMain.handle("invalidate-secrets-cache", () => {
+    invalidateSecretsCache();
   });
 
   ipcMain.handle(
@@ -931,7 +949,11 @@ function setupIPC(): void {
       history?: Array<{ role: string; content: string }>,
       attachments?: Attachment[],
       contextFolder?: string,
+      runId?: string,
     ) => {
+      // Each conversation has a stable runId minted by the renderer. Fall back
+      // to a generated id for legacy callers so the run is still tracked.
+      const chatRunId = runId || `run-${randomUUID()}`;
       if (!isRemoteMode() && !isGatewayRunning(profile)) {
         startGateway(profile);
       }
@@ -953,9 +975,11 @@ function setupIPC(): void {
         }
       }
 
-      if (currentChatAbort) {
-        currentChatAbort();
-      }
+      // Abort only a prior run under the SAME runId (a re-send in the same
+      // conversation). Sibling runs — other background sessions / agents —
+      // keep streaming untouched.
+      const existing = activeRuns.get(chatRunId);
+      if (existing) existing();
 
       let fullResponse = "";
       const chatStartTime = Date.now();
@@ -973,14 +997,19 @@ function setupIPC(): void {
       // (window closed, reloaded, navigated away). Guard every send so a
       // dead sender doesn't crash the IPC handler, and abort the in-flight
       // chat the first time we see one — there's nobody listening anymore.
+      // Every event carries the runId as its first arg so the renderer can
+      // route it to the right conversation among several running at once.
       const safeSend = (channel: string, payload: unknown): boolean => {
         if (event.sender.isDestroyed()) return false;
         try {
-          event.sender.send(channel, payload);
+          event.sender.send(channel, chatRunId, payload);
           return true;
         } catch {
           return false;
         }
+      };
+      const abortThisRun = (): void => {
+        activeRuns.get(chatRunId)?.();
       };
 
       const handle = await sendMessage(
@@ -988,10 +1017,10 @@ function setupIPC(): void {
         {
           onChunk: (chunk) => {
             fullResponse += chunk;
-            if (!safeSend("chat-chunk", chunk) && currentChatAbort) {
+            if (!safeSend("chat-chunk", chunk)) {
               // Renderer is gone — stop generating and resolve with what we
               // have so the awaiting promise doesn't leak.
-              currentChatAbort();
+              abortThisRun();
             }
           },
           onReasoningChunk: (chunk) => {
@@ -999,12 +1028,12 @@ function setupIPC(): void {
             // the renderer can render the thinking bubble live during the
             // stream rather than waiting for a focus-change refresh (#352).
             // Same renderer-gone abort guard as the content channel.
-            if (!safeSend("chat-reasoning-chunk", chunk) && currentChatAbort) {
-              currentChatAbort();
+            if (!safeSend("chat-reasoning-chunk", chunk)) {
+              abortThisRun();
             }
           },
           onDone: (sessionId) => {
-            currentChatAbort = null;
+            activeRuns.delete(chatRunId);
             try {
               persistPromptImageAttachments(sessionId, message, attachments);
             } catch (err) {
@@ -1032,7 +1061,7 @@ function setupIPC(): void {
             }
           },
           onError: (error) => {
-            currentChatAbort = null;
+            activeRuns.delete(chatRunId);
             safeSend("chat-error", error);
             rejectChat(new Error(error));
             // Notify on error too if window not focused
@@ -1063,16 +1092,20 @@ function setupIPC(): void {
         contextFolder,
       );
 
-      currentChatAbort = handle.abort;
+      activeRuns.set(chatRunId, handle.abort);
       return promise;
     },
   );
 
-  ipcMain.handle("abort-chat", () => {
-    if (currentChatAbort) {
-      currentChatAbort();
-      currentChatAbort = null;
+  ipcMain.handle("abort-chat", (_event, runId?: string) => {
+    // Abort one run when given its id; with no id (legacy callers) abort all.
+    if (runId) {
+      activeRuns.get(runId)?.();
+      activeRuns.delete(runId);
+      return;
     }
+    for (const abort of activeRuns.values()) abort();
+    activeRuns.clear();
   });
 
   // Renderer's answer to an inline clarify card. Resolves the pending gateway
@@ -1446,6 +1479,19 @@ function setupIPC(): void {
     }
     return true;
   });
+
+  // Profile appearance (desktop-only avatar + accent colour). Local-only —
+  // these write to the local ~/.hermes profile dirs, not the SSH remote.
+  ipcMain.handle("set-profile-color", (_event, name: string, color: string) =>
+    setProfileColor(name, color),
+  );
+  ipcMain.handle(
+    "set-profile-avatar",
+    (_event, name: string, dataUrl: string) => setProfileAvatar(name, dataUrl),
+  );
+  ipcMain.handle("remove-profile-avatar", (_event, name: string) =>
+    removeProfileAvatar(name),
+  );
 
   // Memory
   ipcMain.handle("read-memory", (_event, profile?: string) => {
@@ -2187,7 +2233,9 @@ function setupUpdater(): void {
   // Log the updater's own lifecycle to <userData>/logs/updater.log so a
   // failed update (e.g. issue #271) leaves something to diagnose.
   autoUpdater.logger = updaterLogger;
-  autoUpdater.autoDownload = false;
+  // Auto-download as soon as an update is found, then surface a single
+  // "Restart to Update" action once it's ready — no manual download step.
+  autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
 
   autoUpdater.on("update-available", (info) => {
@@ -2346,10 +2394,8 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   cleanupTempMediaFiles();
   stopHealthPolling();
-  if (currentChatAbort) {
-    currentChatAbort();
-    currentChatAbort = null;
-  }
+  for (const abort of activeRuns.values()) abort();
+  activeRuns.clear();
   // Leave profile gateways running on quit (see window-all-closed) so bots
   // and other platforms stay online headless.
   stopSshTunnel();
